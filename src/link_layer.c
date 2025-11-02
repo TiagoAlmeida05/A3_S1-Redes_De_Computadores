@@ -160,15 +160,20 @@ int llwrite(const unsigned char *buf, int bufSize)
     int rej = 0;
     int acp = 0;
 
+    signal(SIGALRM, alarmHandler);
+
     while (currentTransmission < retransmitions) {
         rej = 0;
         acp = 0;
-        while (alarmCount < timeout && !rej && !acp) {
-            if (alarmEnabled == FALSE) {
-                alarm(1);
-                alarmEnabled = TRUE;
-            }
-            writeBytesSerialPort(frame, j);
+        alarmCount = 0;
+        alarmEnabled = FALSE;
+
+        alarm(timeout);
+        alarmEnabled = TRUE;
+
+        writeBytesSerialPort(frame, j);
+
+        while (alarmCount == 0 && !rej && !acp) {
             unsigned char res = readControlFrame();
             if (!res) {
                 continue;
@@ -182,9 +187,12 @@ int llwrite(const unsigned char *buf, int bufSize)
         if (acp) break;
         currentTransmission++;
     }
-
+    int final_len = j; // 'j' is the final built length
+    alarm(0);
+    alarmCount = 0;
     free(frame);
-    return acp ? frameSize : -1;
+    return acp ? final_len : -1;
+
 }
 
 ////////////////////////////////////////////////
@@ -209,6 +217,7 @@ int llread(unsigned char *packet)
                 case START:
                     if (byte == FLAG) {
                         state = FLAG_RCV;
+                        receivedFrameIdx = 0;
                         receivedFrame[receivedFrameIdx++] = byte;
                     }
                     break;
@@ -235,19 +244,32 @@ int llread(unsigned char *packet)
                     break;
                 case BCC_OK:
                     receivedFrame[receivedFrameIdx++] = byte;
-                    if (byte == FLAG) state = STOPS;
+                    if (byte == FLAG) {
+                        state = STOPS;
+                    }
                     break;
                 default:
                     break;
+            }
+            // Prevent overflow of receivedFrame
+            if (receivedFrameIdx >= (int)sizeof(receivedFrame)) {
+                fprintf(stderr, "[llread ERROR] receivedFrame overflow\n");
+                return -1;
             }
         }
     }
 
     alarm(0);
 
-    // Extract data
+    // stuffedDataSize is payload bytes between A,C,BCC1 and BCC2/FLAG
     int stuffedDataSize = receivedFrameIdx - 5;
+    if (stuffedDataSize <= 0) {
+        fprintf(stderr, "[llread ERROR] stuffedDataSize <= 0 (%d)\n", stuffedDataSize);
+        return -1;
+    }
+
     unsigned char *stuffedData = (unsigned char *)malloc(stuffedDataSize);
+    if (!stuffedData) { perror("malloc"); return -1; }
     memcpy(stuffedData, receivedFrame + 4, stuffedDataSize);
 
     printf("[llread DEBUG] stuffedDataSize = %d\n", stuffedDataSize);
@@ -255,8 +277,9 @@ int llread(unsigned char *packet)
     for(int _i = 0; _i < stuffedDataSize; _i++) printf("%02X ", stuffedData[_i]);
     printf("\n");
 
-    unsigned char *destuffedData = (unsigned char *)malloc(stuffedDataSize);
-    int destuffedSize;
+    unsigned char *destuffedData = (unsigned char *)malloc(stuffedDataSize); // destuffed will be <= stuffed
+    if (!destuffedData) { free(stuffedData); perror("malloc"); return -1; }
+    int destuffedSize = 0;
     byteDestuffing(stuffedData, stuffedDataSize, destuffedData, &destuffedSize);
     free(stuffedData);
 
@@ -265,16 +288,30 @@ int llread(unsigned char *packet)
     for(int _i = 0; _i < destuffedSize; _i++) printf("%02X ", destuffedData[_i]);
     printf("\n");
 
+    if (destuffedSize <= 0) {
+        fprintf(stderr, "[llread ERROR] destuffedSize <= 0\n");
+        free(destuffedData);
+        return -1;
+    }
+
     unsigned char receivedBCC2 = destuffedData[destuffedSize - 1];
     int payloadSize = destuffedSize - 1;
+    if (payloadSize < 0) { free(destuffedData); return -1; }
+
+    if (payloadSize > MAX_PAYLOAD_SIZE) {
+        fprintf(stderr, "[llread ERROR] payloadSize %d > MAX_PAYLOAD_SIZE %d\n", payloadSize, MAX_PAYLOAD_SIZE);
+        free(destuffedData);
+        return -1;
+    }
 
     unsigned char calculatedBCC2 = 0x00;
     for (int i = 0; i < payloadSize; i++) {
         calculatedBCC2 ^= destuffedData[i];
-        printf("llread: calculated BCC2=0x%02X, received BCC2=0x%02X\n", calculatedBCC2, receivedBCC2);
     }
+    printf("[llread DEBUG] calculatedBCC2=0x%02X, receivedBCC2=0x%02X\n", calculatedBCC2, receivedBCC2);
 
     if (calculatedBCC2 == receivedBCC2) {
+        // safe copy into provided packet buffer (caller must provide MAX_PAYLOAD_SIZE bytes)
         memcpy(packet, destuffedData, payloadSize);
         Nr = 1 - Nr;
         unsigned char rrFrame[5] = {FLAG, ADRESS_RECEIVER, C_Ready(Nr), ADRESS_RECEIVER ^ C_Ready(Nr), FLAG};
@@ -295,19 +332,37 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose(LinkLayer connectionParameters)
 {
+    
     if (connectionParameters.role == LlTx) {
         int retriesLeft = connectionParameters.nRetransmissions;
+        
         while (retriesLeft > 0) {
             unsigned char discFrame[5] = {FLAG, ADRESS_SENDER, DISC, ADRESS_SENDER ^ DISC, FLAG};
             writeBytesSerialPort(discFrame, 5);
+            
             if (baseControlFrame(DISC, connectionParameters.timeout, LlTx) == 0) {
-                unsigned char uaFrame[5] = {FLAG, ADRESS_RECEIVER, UA, ADRESS_RECEIVER ^ UA, FLAG};
+                unsigned char uaFrame[5] = {FLAG, ADRESS_SENDER, UA, ADRESS_SENDER ^ UA, FLAG};
                 writeBytesSerialPort(uaFrame, 5);
                 break;
             }
             retriesLeft--;
         }
+    } else if (connectionParameters.role == LlRx) {
+        
+        // Receiver must wait for DISC from transmitter
+        if (baseControlFrame(DISC, connectionParameters.timeout, LlRx) == 0) {
+            
+            // Send DISC response
+            unsigned char discFrame[5] = {FLAG, ADRESS_RECEIVER, DISC, ADRESS_RECEIVER ^ DISC, FLAG};
+            writeBytesSerialPort(discFrame, 5);
+            
+            // Wait for final UA
+            baseControlFrame(UA, connectionParameters.timeout, LlRx);
+        } else {
+        }
     }
+    
+    printf("[llclose] Closing serial port\n");
     closeSerialPort();
     return 0;
 }
@@ -390,7 +445,12 @@ int baseControlFrame(unsigned char controlByte, int timeout, LinkLayerRole role)
     enum my_states state = START;
     unsigned char A_val = (role == LlTx) ? ADRESS_RECEIVER : ADRESS_SENDER;
 
-    while (state != STOPS) {
+    signal(SIGALRM, alarmHandler);
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+    alarm(timeout);
+
+    while (state != STOPS && alarmCount == 0) {
         unsigned char byte;
         if (readByteSerialPort(&byte)) {
             switch (state) {
@@ -414,5 +474,6 @@ int baseControlFrame(unsigned char controlByte, int timeout, LinkLayerRole role)
             }
         }
     }
+    alarm(0);
     return (state == STOPS) ? 0 : -1;
 }

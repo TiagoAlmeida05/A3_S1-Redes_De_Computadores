@@ -38,10 +38,9 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
         exit(-1);
     }
 
-    switch (connectionParameters.role) {
+        switch (connectionParameters.role) {
         case LlTx: {
             FILE *file = fopen(filename, "rb");
-            printf("filename: %s;\n", filename);
             if (file == NULL) {
                 perror("File not found\n");
                 exit(-1);
@@ -51,83 +50,113 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
             fseek(file, 0L, SEEK_END);
             long int fileSize = ftell(file) - prev;
             fseek(file, prev, SEEK_SET);
-
+            
             unsigned int cpSize;
             unsigned char *controlPacketStart = getControlPacket(1, filename, fileSize, &cpSize);
-            if (llwrite(controlPacketStart, cpSize) == -1)
+            
+            if (llwrite(controlPacketStart, cpSize) == -1) {
                 exit(-1);
+            }
+            free(controlPacketStart);
 
             unsigned char list = 0;
             unsigned char *cont = getData(file, fileSize);
+            unsigned char *contPtr = cont;
             long int remain = fileSize;
+            
 
+            int packetCount = 0;
             while (remain > 0) {
-                int dataSize = remain > (long int)MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : remain;
+                int dataSize = remain > (long int)(MAX_PAYLOAD_SIZE - 4) ? (MAX_PAYLOAD_SIZE - 4) : remain;
                 unsigned char *data = (unsigned char *)malloc(dataSize);
-                memcpy(data, cont, dataSize);
+                memcpy(data, contPtr, dataSize);
 
                 int packetSize;
                 unsigned char *packet = getDataPacket(list, data, dataSize, &packetSize);
 
-                if (llwrite(packet, packetSize) == -1)
+                if (llwrite(packet, packetSize) == -1) {
                     exit(-1);
+                }
+                
 
-                remain -= (long int)MAX_PAYLOAD_SIZE;
-                cont += dataSize;
+                remain -= (long int)dataSize;
+                contPtr += dataSize;
                 list = (list + 1) % 255;
+                packetCount++;
 
                 free(packet);
                 free(data);
             }
 
             free(cont);
+            fclose(file);
             
             unsigned char *controlPacketEnd = getControlPacket(3, filename, fileSize, &cpSize);
-            if (llwrite(controlPacketEnd, cpSize) == -1)
+            
+            if (llwrite(controlPacketEnd, cpSize) == -1) {
                 exit(-1);
+            }
 
+            free(controlPacketEnd);
             llclose(connectionParameters);
             break;
         }
 
         case LlRx: {
             unsigned char *packet = (unsigned char *)malloc(MAX_PAYLOAD_SIZE);
+            if (!packet) { perror("malloc"); exit(-1); }
             int packetSize = -1;
 
-            while ((packetSize = llread(packet)) < 0);
-
+            // receive START
+            while((packetSize = llread(packet)) < 0);
             unsigned long int fileSize = 0;
             unsigned char *originalFileName = getSizeAndName(packet, packetSize, &fileSize);
-
-            free(originalFileName);
-
-            const char *outputFileName = "penguin-received.gif";
-            FILE *newFile = fopen(outputFileName, "wb");
-
-            if(newFile == NULL){
-                perror("Error creating output file");
+            
+            if (!originalFileName) {
+                free(packet);
+                llclose(connectionParameters);
                 exit(-1);
             }
-            
+            free(originalFileName);
+
+            FILE *newFile = fopen(filename, "wb");
+            if (newFile == NULL) {
+                perror("Error creating output file");
+                free(packet);
+                exit(-1);
+            }
+
             unsigned long int receivedBytes = 0;
             unsigned char list = 0;
 
-            while (receivedBytes < fileSize) {
+            while (1) {
                 while ((packetSize = llread(packet)) < 0);
+                if (packetSize <= 0) continue;
 
-                if (packet[0] == 3)
+                if (packet[0] == 3) { // END
+                    unsigned long int endFileSize = 0;
+                    unsigned char *endFileName = getSizeAndName(packet, packetSize, &endFileSize);
+                    if (endFileName) {
+                        free(endFileName);
+                    }
                     break;
-                else if (packet[0] == 2) {
+                } else if (packet[0] == 2) {
+                    if (packetSize < 4) {
+                        continue;
+                    }
                     unsigned int dataSize = ((unsigned int)packet[2] << 8) | packet[3];
+                    if ((int)(4 + dataSize) > packetSize) {
+                        continue;
+                    }
                     fwrite(packet + 4, sizeof(unsigned char), dataSize, newFile);
                     receivedBytes += dataSize;
-                    list = (list + 1) % 255;
-                } else
-                    fprintf(stderr, "Invalid packet type received: %d\n", packet[0]);
+                    list = (list + 1) % 2; 
+                }
             }
 
             fclose(newFile);
             free(packet);
+            llclose(connectionParameters);
             break;
         }
 
@@ -147,29 +176,38 @@ unsigned char *getControlPacket(const unsigned int c, const char *filename, long
         L1++;
         temp >>= 8;
     }
+    if (L1 == 0) L1 = 1;
 
-    const int L2 = strlen(filename);
-    *size = 1 + 2 + L1 + 2 + L2;
+    const int L2 = (int)strlen(filename);
+
+    *size = 1 + 1 + 1 + L1 + 1 + 1 + L2;
 
     unsigned char *packet = (unsigned char *)malloc(*size);
+    if (!packet) { perror("malloc"); exit(-1); }
+
     unsigned int pos = 0;
+    packet[pos++] = (unsigned char)c;    
+    packet[pos++] = 0;                  
+    packet[pos++] = (unsigned char)L1;  
 
-    packet[pos++] = c;
-    packet[pos++] = 0;
-    packet[pos++] = L1;
-
-    for (unsigned int i = 0; i < L1; i++) {
-        packet[2 + L1 - i] = length & 0xFF;
-        length >>= 8;
+    for (int i = L1 - 1; i >= 0; --i) {
+        packet[pos++] = (unsigned char)((length >> (8 * i)) & 0xFF);
     }
 
-    pos += L1;
-    packet[pos++] = 1;
-    packet[pos++] = L2;
+    packet[pos++] = 1;                   
+    packet[pos++] = (unsigned char)L2;   
     memcpy(packet + pos, filename, L2);
+    pos += L2;
+
+    if (pos != *size) {
+        free(packet);
+        exit(-1);
+    }
 
     return packet;
 }
+
+
 
 unsigned char *getData(FILE *file, long int fileSize)
 {
@@ -194,17 +232,49 @@ unsigned char *getDataPacket(unsigned char list, unsigned char *data, int dataSi
 
 unsigned char *getSizeAndName(unsigned char *packet, int size, unsigned long int *fileSize)
 {
+    if (!packet || size <= 0) {
+        fprintf(stderr, "[getSizeAndName ERROR] null/zero packet\n");
+        return NULL;
+    }
+
+    if (size < 5) {
+        fprintf(stderr, "[getSizeAndName ERROR] packet too small (size=%d)\n", size);
+        return NULL;
+    }
+
     *fileSize = 0;
-    unsigned char fileSizeBytes = packet[2];
+    unsigned int fileSizeBytes = (unsigned int)packet[2];
 
-    for (unsigned int i = 0; i < fileSizeBytes; i++)
-        *fileSize |= ((unsigned long int)packet[3 + i] << (8 * (fileSizeBytes - i - 1)));
+    if (3 + (int)fileSizeBytes >= size) {
+        fprintf(stderr, "[getSizeAndName ERROR] fileSizeBytes too large: %u (packet size=%d)\n", fileSizeBytes, size);
+        return NULL;
+    }
 
-    unsigned char fileNameBytes = packet[3 + fileSizeBytes + 1];
+    for (unsigned int i = 0; i < fileSizeBytes; i++) {
+        *fileSize = (*fileSize << 8) | (unsigned long int)packet[3 + i];
+    }
+
+    unsigned int idx_after_size = 3 + fileSizeBytes;
+    if (idx_after_size + 1 >= (unsigned int)size) {
+        fprintf(stderr, "[getSizeAndName ERROR] missing filename length (packet size=%d)\n", size);
+        return NULL;
+    }
+
+    unsigned int fileNameBytes = (unsigned int)packet[idx_after_size + 1];
+    unsigned int nameOffset = idx_after_size + 2;
+
+    if (nameOffset + fileNameBytes > (unsigned int)size) {
+        fprintf(stderr, "[getSizeAndName ERROR] filename length too large: %u (packet size=%d)\n", fileNameBytes, size);
+        return NULL;
+    }
+
     unsigned char *name = (unsigned char *)malloc(fileNameBytes + 1);
+    if (!name) { perror("malloc"); exit(-1); }
 
-    memcpy(name, packet + 3 + fileSizeBytes + 2, fileNameBytes);
+    memcpy(name, packet + nameOffset, fileNameBytes);
     name[fileNameBytes] = '\0';
+
+    printf("[getSizeAndName DEBUG] fileSize=%lu, filename=\"%s\"\n", *fileSize, name);
 
     return name;
 }
