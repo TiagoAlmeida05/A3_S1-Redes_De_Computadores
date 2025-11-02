@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdbool.h>
+#include <errno.h>
 #include "link_layer.h"
 #include "serial_port.h"
 
@@ -26,8 +27,8 @@
 #define C_Reject(Nr) (0x54 | (Nr & 0x01))
 
 // Global Variables
-int alarmEnabled = FALSE;
-int alarmCount = 0;
+volatile int alarmEnabled = FALSE;
+volatile int alarmCount = 0;
 unsigned char infoFrameSender = 0;
 int retransmitions = 0;
 int timeout = 0;
@@ -70,8 +71,16 @@ int llopen(LinkLayer connectionParameters)
 
     switch (role) {
         case LlTx: {
-            signal(SIGALRM, alarmHandler);
-            while (connectionParameters.nRetransmissions != 0 && state != STOPS) {
+            struct sigaction sa;
+            sa.sa_handler = alarmHandler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0; 
+            sigaction(SIGALRM, &sa, NULL);
+            
+            int tries = retransmitions;
+            
+            while (tries > 0 && state != STOPS) {   
+
                 unsigned char buf[5] = {FLAG, ADRESS_SENDER, SET, ADRESS_SENDER ^ SET, FLAG};
 
                 printf("[llopen TX] Sending SET frame: ");
@@ -79,23 +88,41 @@ int llopen(LinkLayer connectionParameters)
                 printf("\n");
 
                 writeBytesSerialPort(buf, 5);
+                
+                alarmCount = 0;
+                alarmEnabled = TRUE;
                 alarm(timeout);
-                alarmEnabled = FALSE;
+                
                 int res = baseControlFrame(UA, timeout, LlTx);
 
+                alarm(0); 
+                alarmEnabled = FALSE;
+
                 if(res == 0){
-                    printf("[llopen TX] UA received successfully, exiting loop.\n");
+                    printf("[llopen TX] UA received successfully!\n");
                     state = STOPS;
                     break;
                 }
 
-                printf("[llopen TX] baseControlFrame returned: %d\n", res);
-
-                connectionParameters.nRetransmissions--;
+                printf("[llopen TX] Failed to receive UA (alarmCount=%d, res=%d)\n", alarmCount, res);
+                tries--;
+                
+                printf("[llopen TX] Tries remaining: %d\n", tries);
+                
+                if (tries > 0) {
+                    printf("[llopen TX] Retrying...\n\n");
+                }
+            }
+                        
+            if(state != STOPS){
+                printf("[llopen TX] ERROR: Exceeded maximum retransmissions (%d attempts)\n", retransmitions);
+                closeSerialPort();
+                return -1;               
             }
             break;
         }
         case LlRx: {
+            printf("[llopen RX] Waiting for SET frame...\n");
             baseControlFrame(SET, timeout, LlRx);
             unsigned char buf[5] = {FLAG, ADRESS_RECEIVER, UA, ADRESS_RECEIVER ^ UA, FLAG};
 
@@ -160,18 +187,22 @@ int llwrite(const unsigned char *buf, int bufSize)
     int rej = 0;
     int acp = 0;
 
-    signal(SIGALRM, alarmHandler);
+    struct sigaction sa;
+    sa.sa_handler = alarmHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
 
     while (currentTransmission < retransmitions) {
         rej = 0;
         acp = 0;
         alarmCount = 0;
-        alarmEnabled = FALSE;
-
-        alarm(timeout);
         alarmEnabled = TRUE;
 
+        printf("[llwrite] Sending frame (attempt %d/%d)\n", currentTransmission + 1, retransmitions);
         writeBytesSerialPort(frame, j);
+        
+        alarm(timeout);
 
         while (alarmCount == 0 && !rej && !acp) {
             unsigned char res = readControlFrame();
@@ -182,17 +213,33 @@ int llwrite(const unsigned char *buf, int bufSize)
                 infoFrameSender = (infoFrameSender + 1) % 2;
             } else if (res == C_Reject(0) || res == C_Reject(1)) {
                 rej = 1;
-            } else continue;
+            }
         }
-        if (acp) break;
+        
+        alarm(0);
+        alarmEnabled = FALSE;
+        
+        if (acp) {
+            printf("[llwrite] Frame acknowledged successfully\n");
+            break;
+        }
+        
+        if (alarmCount > 0) {
+            printf("[llwrite] Timeout on attempt %d (alarmCount=%d)\n", currentTransmission + 1, alarmCount);
+        }
+        
         currentTransmission++;
     }
-    int final_len = j; // 'j' is the final built length
-    alarm(0);
-    alarmCount = 0;
+    
+    int final_len = j;
     free(frame);
-    return acp ? final_len : -1;
-
+    
+    if (!acp) {
+        printf("[llwrite] ERROR: Failed after %d attempts\n", retransmitions);
+        return -1;
+    }
+    
+    return final_len;
 }
 
 ////////////////////////////////////////////////
@@ -205,7 +252,7 @@ int llread(unsigned char *packet)
     int receivedFrameIdx = 0;
     unsigned char A_val = ADRESS_SENDER;
 
-    signal(SIGALRM, alarmHandler);
+    (void) signal(SIGALRM, alarmHandler);
     alarmEnabled = FALSE;
     alarmCount = 0;
 
@@ -251,7 +298,6 @@ int llread(unsigned char *packet)
                 default:
                     break;
             }
-            // Prevent overflow of receivedFrame
             if (receivedFrameIdx >= (int)sizeof(receivedFrame)) {
                 fprintf(stderr, "[llread ERROR] receivedFrame overflow\n");
                 return -1;
@@ -261,7 +307,6 @@ int llread(unsigned char *packet)
 
     alarm(0);
 
-    // stuffedDataSize is payload bytes between A,C,BCC1 and BCC2/FLAG
     int stuffedDataSize = receivedFrameIdx - 5;
     if (stuffedDataSize <= 0) {
         fprintf(stderr, "[llread ERROR] stuffedDataSize <= 0 (%d)\n", stuffedDataSize);
@@ -277,7 +322,7 @@ int llread(unsigned char *packet)
     for(int _i = 0; _i < stuffedDataSize; _i++) printf("%02X ", stuffedData[_i]);
     printf("\n");
 
-    unsigned char *destuffedData = (unsigned char *)malloc(stuffedDataSize); // destuffed will be <= stuffed
+    unsigned char *destuffedData = (unsigned char *)malloc(stuffedDataSize);
     if (!destuffedData) { free(stuffedData); perror("malloc"); return -1; }
     int destuffedSize = 0;
     byteDestuffing(stuffedData, stuffedDataSize, destuffedData, &destuffedSize);
@@ -311,7 +356,6 @@ int llread(unsigned char *packet)
     printf("[llread DEBUG] calculatedBCC2=0x%02X, receivedBCC2=0x%02X\n", calculatedBCC2, receivedBCC2);
 
     if (calculatedBCC2 == receivedBCC2) {
-        // safe copy into provided packet buffer (caller must provide MAX_PAYLOAD_SIZE bytes)
         memcpy(packet, destuffedData, payloadSize);
         Nr = 1 - Nr;
         unsigned char rrFrame[5] = {FLAG, ADRESS_RECEIVER, C_Ready(Nr), ADRESS_RECEIVER ^ C_Ready(Nr), FLAG};
@@ -332,33 +376,59 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose(LinkLayer connectionParameters)
 {
+    struct sigaction sa;
+    sa.sa_handler = alarmHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
     
     if (connectionParameters.role == LlTx) {
         int retriesLeft = connectionParameters.nRetransmissions;
         
         while (retriesLeft > 0) {
+            
             unsigned char discFrame[5] = {FLAG, ADRESS_SENDER, DISC, ADRESS_SENDER ^ DISC, FLAG};
+            printf("[llclose TX] Sending DISC frame\n");
             writeBytesSerialPort(discFrame, 5);
             
+            alarmCount = 0; 
+            alarmEnabled = TRUE;
+            alarm(timeout);
+            
             if (baseControlFrame(DISC, connectionParameters.timeout, LlTx) == 0) {
+                alarm(0);
+                alarmEnabled = FALSE;
+                printf("[llclose TX] DISC received, sending UA\n");
                 unsigned char uaFrame[5] = {FLAG, ADRESS_SENDER, UA, ADRESS_SENDER ^ UA, FLAG};
                 writeBytesSerialPort(uaFrame, 5);
                 break;
             }
-            retriesLeft--;
-        }
-    } else if (connectionParameters.role == LlRx) {
-        
-        // Receiver must wait for DISC from transmitter
-        if (baseControlFrame(DISC, connectionParameters.timeout, LlRx) == 0) {
             
-            // Send DISC response
+            alarm(0); 
+            alarmEnabled = FALSE;
+            
+            printf("[llclose TX] Timeout waiting for DISC (alarmCount=%d)\n", alarmCount);
+            retriesLeft--;
+            
+            if (retriesLeft > 0) {
+                printf("[llclose TX] Retrying...\n");
+            }
+        }
+        
+        if (retriesLeft == 0) {
+            printf("[llclose TX] ERROR: Failed to close connection properly\n");
+        }
+        
+    } else if (connectionParameters.role == LlRx) {
+        printf("[llclose RX] Waiting for DISC from transmitter\n");
+        
+        if (baseControlFrame(DISC, connectionParameters.timeout, LlRx) == 0) {
+            printf("[llclose RX] DISC received, sending DISC response\n");
             unsigned char discFrame[5] = {FLAG, ADRESS_RECEIVER, DISC, ADRESS_RECEIVER ^ DISC, FLAG};
             writeBytesSerialPort(discFrame, 5);
             
-            // Wait for final UA
+            printf("[llclose RX] Waiting for final UA\n");
             baseControlFrame(UA, connectionParameters.timeout, LlRx);
-        } else {
         }
     }
     
@@ -372,7 +442,8 @@ int llclose(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 void alarmHandler(int signal)
 {
-    alarmEnabled = TRUE;
+    printf("[ALARM] Alarm #%d triggered!\n", alarmCount + 1);
+    alarmEnabled = FALSE;
     alarmCount++;
 }
 
@@ -381,7 +452,13 @@ unsigned char readControlFrame()
     unsigned char byte = 0;
     unsigned char c = 0;
     enum my_states state = START;
-    while (alarmCount < timeout && state != STOPS) {
+    
+    while (state != STOPS) {
+        if (alarmCount > 0) {
+            printf("[readControlFrame] Timeout - alarm triggered (alarmCount=%d)\n", alarmCount);
+            return 0;
+        }
+        
         if (readByteSerialPort(&byte)) {
             printf("[readControlFrame] Received byte: 0x%02X\n", byte);
             switch (state) {
@@ -409,6 +486,7 @@ unsigned char readControlFrame()
             }
         }
     }
+    
     printf("[readControlFrame] Control frame extracted: 0x%02X\n", c);
     return c;
 }
@@ -445,35 +523,57 @@ int baseControlFrame(unsigned char controlByte, int timeout, LinkLayerRole role)
     enum my_states state = START;
     unsigned char A_val = (role == LlTx) ? ADRESS_RECEIVER : ADRESS_SENDER;
 
-    signal(SIGALRM, alarmHandler);
-    alarmEnabled = FALSE;
-    alarmCount = 0;
-    alarm(timeout);
-
-    while (state != STOPS && alarmCount == 0) {
+    int bytesRead = 0;
+    while (state != STOPS) {
+        if (alarmCount > 0) {
+            printf("[baseControlFrame] Alarm detected, breaking loop (alarmCount=%d, bytesRead=%d)\n", alarmCount, bytesRead);
+            break;
+        }
+        
         unsigned char byte;
-        if (readByteSerialPort(&byte)) {
+        int readResult = readByteSerialPort(&byte);
+        
+        if (readResult) {
+            bytesRead++;
+            printf("[baseControlFrame] Received byte: 0x%02X (state=%d, total bytes=%d)\n", byte, state, bytesRead);
             switch (state) {
                 case START:
                     if (byte == FLAG) state = FLAG_RCV;
                     break;
                 case FLAG_RCV:
                     if (byte == A_val) state = A_RCV;
+                    else if (byte != FLAG) state = START;
                     break;
                 case A_RCV:
                     if (byte == controlByte) state = C_RCV;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
                     break;
                 case C_RCV:
                     if (byte == (A_val ^ controlByte)) state = BCC_OK;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
                     break;
                 case BCC_OK:
                     if (byte == FLAG) state = STOPS;
+                    else state = START;
                     break;
                 default:
                     break;
             }
+        } else {
+            if (alarmCount > 0) {
+                printf("[baseControlFrame] Alarm detected after empty read (alarmCount=%d)\n", alarmCount);
+                break;
+            }
         }
     }
-    alarm(0);
-    return (state == STOPS) ? 0 : -1;
+    
+    if (state == STOPS) {
+        printf("[baseControlFrame] Successfully received control frame 0x%02X\n", controlByte);
+        return 0;
+    } else {
+        printf("[baseControlFrame] Failed to receive control frame (state=%d, alarmCount=%d)\n", state, alarmCount);
+        return -1;
+    }
 }
