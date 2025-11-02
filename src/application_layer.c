@@ -80,6 +80,8 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                 free(data);
             }
 
+            free(cont);
+            
             unsigned char *controlPacketEnd = getControlPacket(3, filename, fileSize, &cpSize);
             if (llwrite(controlPacketEnd, cpSize) == -1)
                 exit(-1);
@@ -95,11 +97,18 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
             while ((packetSize = llread(packet)) < 0);
 
             unsigned long int fileSize = 0;
-            //unsigned char *name = getSizeAndName(packet, packetSize, &fileSize);
-            char name[] = "penguin-received.gif";
-            FILE *newFile = fopen((char *)name, "wb");
-            printf("FILENAME: %s\n.", name);
+            unsigned char *originalFileName = getSizeAndName(packet, packetSize, &fileSize);
 
+            free(originalFileName);
+
+            const char *outputFileName = "penguin-received.gif";
+            FILE *newFile = fopen(outputFileName, "wb");
+
+            if(newFile == NULL){
+                perror("Error creating output file");
+                exit(-1);
+            }
+            
             unsigned long int receivedBytes = 0;
             unsigned char list = 0;
 
